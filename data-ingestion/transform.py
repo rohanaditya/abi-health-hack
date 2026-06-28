@@ -10,6 +10,8 @@ CRITICAL ID types:
   - raw_diagnosis/raw_coverage.patient_id           = STRING  (patient["patient_id"])
 """
 
+from __future__ import annotations
+
 import json
 from datetime import datetime
 from typing import Any
@@ -92,7 +94,7 @@ def api_note_to_row(note: dict[str, Any], source_id: int, fetched_at: datetime) 
 def api_assessment_to_row(assessment: dict[str, Any], source_id: int, fetched_at: datetime) -> dict[str, Any]:
     """Map /pcc/assessments item to raw_assessment columns."""
     raw_json = assessment.get("raw_json")
-    # Normalize to JSON string so db.py can wrap it in Json() for psycopg2 jsonb
+    # psycopg2 needs a JSON string for the ::jsonb cast in upsert_assessments
     if isinstance(raw_json, dict):
         raw_json = json.dumps(raw_json)
     elif raw_json is not None and not isinstance(raw_json, str):

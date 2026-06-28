@@ -2,9 +2,10 @@
 Patient sync: pulls patients for all three facilities and upserts raw_patient.
 
 Returns the full list of patient objects fetched (carrying both id types) so
-sync_clinical can fan out without re-fetching. A per-facility failure marks
-that facility's watermark as 'failed' and continues with others.
+sync_clinical can fan out without re-fetching.
 """
+
+from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
@@ -27,7 +28,6 @@ logger = logging.getLogger(__name__)
 
 
 def _parse_iso(s: str) -> datetime:
-    """Parse ISO 8601 string (including Z suffix) to a timezone-aware datetime."""
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
@@ -38,10 +38,8 @@ def sync_patients(
     """
     Sync patients from all facilities.
 
-    Returns:
-        (all_patients, counts) where all_patients carries both `id` (int) and
-        `patient_id` (str) so downstream syncs can use the right identifier,
-        and counts = {"raw_patient": N} of actually upserted rows.
+    Returns (all_patients, counts) where all_patients carries both `id` (int)
+    and `patient_id` (str) for use by downstream clinical syncs.
     """
     all_patients: list[dict[str, Any]] = []
     total_upserted = 0
@@ -51,9 +49,7 @@ def sync_patients(
         since = read_watermark(conn, source_id, entity_type, facility_id)
         set_watermark_running(conn, source_id, entity_type, facility_id)
 
-        logger.info(
-            "Syncing patients facility=%d since=%s", facility_id, since or "beginning"
-        )
+        logger.info("Syncing patients facility=%d since=%s", facility_id, since or "beginning")
 
         try:
             patients = get_patients(facility_id, since=since)
@@ -76,9 +72,6 @@ def sync_patients(
             fail_watermark(conn, source_id, entity_type, facility_id)
             continue
 
-        # Advance watermark to MAX(source_last_modified_at) minus safety buffer.
-        # If no records were returned, advance to now minus buffer so next run
-        # starts from a known-clean point.
         modified_vals = [
             r["source_last_modified_at"]
             for r in rows

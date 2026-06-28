@@ -10,6 +10,8 @@ so identical re-fetched rows are no-ops. RETURNING id lets us count actual
 inserts/updates vs. skipped no-ops.
 """
 
+from __future__ import annotations
+
 import json
 import logging
 from datetime import datetime
@@ -149,10 +151,7 @@ def _extract_values(rows: list[dict[str, Any]], cols: list[str]) -> list[list[An
 
 
 def upsert_patients(conn: psycopg2.extensions.connection, rows: list[dict[str, Any]]) -> int:
-    """
-    Upsert raw_patient rows. Returns count of rows actually inserted or updated
-    (excludes hash-match no-ops). Caller must commit.
-    """
+    """Upsert raw_patient rows. Returns count of rows actually inserted or updated. Caller must commit."""
     if not rows:
         return 0
     cols = [
@@ -246,10 +245,7 @@ def upsert_notes(conn: psycopg2.extensions.connection, rows: list[dict[str, Any]
 
 
 def upsert_assessments(conn: psycopg2.extensions.connection, rows: list[dict[str, Any]]) -> int:
-    """
-    Upsert raw_assessment rows. Conflict target: (id).
-    raw_json is a JSON string; cast to jsonb via template.
-    """
+    """Upsert raw_assessment rows. Conflict target: (id). raw_json cast to jsonb."""
     if not rows:
         return 0
     cols = [
@@ -259,15 +255,11 @@ def upsert_assessments(conn: psycopg2.extensions.connection, rows: list[dict[str
         "sync_version", "is_current", "fetched_at", "row_hash",
     ]
     update_cols = [c for c in cols if c != "id"]
-
-    # Cast raw_json (string) to jsonb in the template
-    raw_json_idx = cols.index("raw_json") + 1  # 1-based position in VALUES tuple
+    raw_json_idx = cols.index("raw_json") + 1
     placeholders = ", ".join(
-        f"%s::jsonb" if i + 1 == raw_json_idx else "%s"
+        "%s::jsonb" if i + 1 == raw_json_idx else "%s"
         for i in range(len(cols))
     )
-    template = f"({placeholders})"
-
     sql = f"""
         INSERT INTO raw_assessment ({', '.join(cols)})
         VALUES %s
@@ -278,7 +270,7 @@ def upsert_assessments(conn: psycopg2.extensions.connection, rows: list[dict[str
     """
     with conn.cursor() as cur:
         result = psycopg2.extras.execute_values(
-            cur, sql, _extract_values(rows, cols), template=template, fetch=True
+            cur, sql, _extract_values(rows, cols), template=f"({placeholders})", fetch=True
         )
     logger.debug("upsert_assessments: %d/%d rows changed", len(result), len(rows))
     return len(result)

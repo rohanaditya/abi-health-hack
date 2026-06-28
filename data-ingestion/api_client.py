@@ -10,6 +10,8 @@ CRITICAL: Two patient ID types exist — do NOT mix them.
   - id         (int, e.g. 1)         -> /notes, /assessments
 """
 
+from __future__ import annotations
+
 import logging
 import random
 import time

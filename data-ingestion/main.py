@@ -3,11 +3,9 @@ Ingestion orchestrator: health check -> patients -> clinical data -> summary.
 
 Run with:
     python3 main.py
-
-Each entity's failure is isolated: one failing watermark does not abort others.
-The final human-facing line is either a per-table upsert summary or the
-"no new data" message when every record was a hash-match no-op.
 """
+
+from __future__ import annotations
 
 import logging
 import sys
@@ -37,7 +35,6 @@ def _merge_counts(a: dict[str, int], b: dict[str, int]) -> dict[str, int]:
 def main() -> None:
     logger.info("=== PCC ingestion run starting ===")
 
-    # API health check — abort early if the API is unreachable
     try:
         health = get_health()
         logger.info("API health OK: %s", health)
@@ -55,36 +52,35 @@ def main() -> None:
 
         total_counts: dict[str, int] = {}
 
-        # --- 1. Patients (all facilities) ---
+        # 1. Patients
         patients: list[dict[str, Any]] = []
         try:
             patients, patient_counts = sync_patients(conn, source_id)
             total_counts = _merge_counts(total_counts, patient_counts)
             logger.info(
-                "Patient sync complete: %d patients fetched, %d upserted",
+                "Patient sync complete: %d fetched, %d upserted",
                 len(patients), patient_counts.get("raw_patient", 0),
             )
         except Exception as exc:
-            logger.error("Patient sync raised an unexpected error: %s", exc)
+            logger.error("Patient sync failed: %s", exc)
 
-        # --- 2. Clinical: diagnoses + coverage (per changed patient, STRING id) ---
+        # 2. Diagnoses + coverage
         if patients:
             try:
                 dc_counts = sync_diagnoses_and_coverage(conn, source_id, patients)
                 total_counts = _merge_counts(total_counts, dc_counts)
             except Exception as exc:
-                logger.error("Diagnoses/coverage sync raised an unexpected error: %s", exc)
+                logger.error("Diagnoses/coverage sync failed: %s", exc)
 
-            # --- 3. Clinical: notes + assessments (per changed patient, INT id) ---
+            # 3. Notes + assessments
             try:
                 na_counts = sync_notes_and_assessments(conn, source_id, patients)
                 total_counts = _merge_counts(total_counts, na_counts)
             except Exception as exc:
-                logger.error("Notes/assessments sync raised an unexpected error: %s", exc)
+                logger.error("Notes/assessments sync failed: %s", exc)
         else:
             logger.info("No patients fetched — skipping clinical sync")
 
-        # --- Human-facing summary ---
         total_upserted = sum(total_counts.values())
         if total_upserted == 0:
             print("No new data to add. Database already up to date.")
@@ -96,6 +92,7 @@ def main() -> None:
 
     finally:
         conn.close()
+
     logger.info("=== PCC ingestion run finished ===")
 
 
