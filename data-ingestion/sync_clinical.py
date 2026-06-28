@@ -3,18 +3,22 @@ Clinical data sync: diagnoses, coverage, notes, and assessments.
 
 sync_diagnoses_and_coverage  — uses STRING patient_id; no since param.
 sync_notes_and_assessments   — uses INTEGER patient id; since from per-facility watermark.
+
+API calls run in parallel (bounded by MAX_CONCURRENT_REQUESTS); DB writes stay on the
+main thread because psycopg2 connections are not thread-safe.
 """
 
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import psycopg2.extensions
 
 from api_client import RateLimitExhausted, get_assessments, get_coverage, get_diagnoses, get_notes
-from config import WATERMARK_BUFFER_SECONDS
+from config import MAX_CONCURRENT_REQUESTS, WATERMARK_BUFFER_SECONDS
 from db import (
     advance_watermark,
     fail_watermark,
@@ -49,6 +53,18 @@ def _parse_date_field(val: Any) -> datetime | None:
     return None
 
 
+def _fetch_diagnoses_and_coverage(patient_id_str: str) -> tuple[list[dict], list[dict]]:
+    return get_diagnoses(patient_id_str), get_coverage(patient_id_str)
+
+
+def _fetch_notes(patient_int_id: int, since: datetime | None) -> list[dict]:
+    return get_notes(patient_int_id, since=since)
+
+
+def _fetch_assessments(patient_int_id: int, since: datetime | None) -> list[dict]:
+    return get_assessments(patient_int_id, since=since)
+
+
 def sync_diagnoses_and_coverage(
     conn: psycopg2.extensions.connection,
     source_id: int,
@@ -62,34 +78,53 @@ def sync_diagnoses_and_coverage(
     cov_total = 0
     fetched_at = datetime.now(timezone.utc)
 
-    for patient in patients:
-        patient_id_str: str | None = patient.get("patient_id")
-        if not patient_id_str:
-            logger.warning("Patient id=%s has no string patient_id — skipping", patient.get("id"))
-            continue
+    eligible = [
+        p for p in patients
+        if p.get("patient_id")
+    ]
+    skipped = len(patients) - len(eligible)
+    if skipped:
+        logger.warning("%d patients missing string patient_id — skipping", skipped)
 
-        try:
-            diagnoses = get_diagnoses(patient_id_str)
-            coverage = get_coverage(patient_id_str)
-        except RateLimitExhausted as exc:
-            logger.error("Rate limit exhausted diagnoses/coverage patient=%s: %s", patient_id_str, exc)
-            continue
-        except Exception as exc:
-            logger.error("Error fetching diagnoses/coverage patient=%s: %s", patient_id_str, exc)
-            continue
+    if not eligible:
+        return {"raw_diagnosis": 0, "raw_coverage": 0}
 
-        diag_rows = [api_diagnosis_to_row(d, source_id, fetched_at) for d in diagnoses]
-        cov_rows = [api_coverage_to_row(c, source_id, fetched_at) for c in coverage]
+    logger.info(
+        "Fetching diagnoses/coverage for %d patients (%d workers)",
+        len(eligible), MAX_CONCURRENT_REQUESTS,
+    )
 
-        try:
-            if diag_rows:
-                diag_total += upsert_diagnoses(conn, diag_rows)
-            if cov_rows:
-                cov_total += upsert_coverage(conn, cov_rows)
-            conn.commit()
-        except Exception as exc:
-            conn.rollback()
-            logger.error("DB error upserting diagnoses/coverage patient=%s: %s", patient_id_str, exc)
+    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS) as pool:
+        futures = {
+            pool.submit(_fetch_diagnoses_and_coverage, p["patient_id"]): p
+            for p in eligible
+        }
+
+        for future in as_completed(futures):
+            patient = futures[future]
+            patient_id_str: str = patient["patient_id"]
+
+            try:
+                diagnoses, coverage = future.result()
+            except RateLimitExhausted as exc:
+                logger.error("Rate limit exhausted diagnoses/coverage patient=%s: %s", patient_id_str, exc)
+                continue
+            except Exception as exc:
+                logger.error("Error fetching diagnoses/coverage patient=%s: %s", patient_id_str, exc)
+                continue
+
+            diag_rows = [api_diagnosis_to_row(d, source_id, fetched_at) for d in diagnoses]
+            cov_rows = [api_coverage_to_row(c, source_id, fetched_at) for c in coverage]
+
+            try:
+                if diag_rows:
+                    diag_total += upsert_diagnoses(conn, diag_rows)
+                if cov_rows:
+                    cov_total += upsert_coverage(conn, cov_rows)
+                conn.commit()
+            except Exception as exc:
+                conn.rollback()
+                logger.error("DB error upserting diagnoses/coverage patient=%s: %s", patient_id_str, exc)
 
     logger.info(
         "Diagnoses/coverage sync: %d diagnoses, %d coverage upserted across %d patients",
@@ -122,53 +157,73 @@ def sync_notes_and_assessments(
             since = read_watermark(conn, source_id, entity_type, facility_id)
             set_watermark_running(conn, source_id, entity_type, facility_id)
 
+            eligible = [p for p in fac_patients if p.get("id") is not None]
+
             logger.info(
-                "Syncing %ss facility=%d (%d patients) since=%s",
-                entity_type, facility_id, len(fac_patients), since or "beginning",
+                "Syncing %ss facility=%d (%d patients, %d workers) since=%s",
+                entity_type, facility_id, len(eligible), MAX_CONCURRENT_REQUESTS,
+                since or "beginning",
             )
 
             all_date_vals: list[datetime] = []
             entity_upserted = 0
             failed = False
             fetched_at = datetime.now(timezone.utc)
+            date_field = "effective_date" if entity_type == "note" else "assessment_date"
 
-            for patient in fac_patients:
-                patient_int_id: int | None = patient.get("id")
-                if patient_int_id is None:
-                    continue
+            if not eligible:
+                advance_watermark(
+                    conn, source_id, entity_type, facility_id,
+                    fetched_at - timedelta(seconds=WATERMARK_BUFFER_SECONDS), 0,
+                )
+                continue
 
-                try:
-                    if entity_type == "note":
-                        records = get_notes(patient_int_id, since=since)
-                        rows = [api_note_to_row(r, source_id, fetched_at) for r in records]
-                        date_field = "effective_date"
-                    else:
-                        records = get_assessments(patient_int_id, since=since)
-                        rows = [api_assessment_to_row(r, source_id, fetched_at) for r in records]
-                        date_field = "assessment_date"
-                except RateLimitExhausted as exc:
-                    logger.error("Rate limit exhausted %s patient_id=%s: %s", entity_type, patient_int_id, exc)
-                    failed = True
-                    break
-                except Exception as exc:
-                    logger.error("Error fetching %ss patient_id=%s: %s", entity_type, patient_int_id, exc)
-                    continue
+            fetch_fn = _fetch_notes if entity_type == "note" else _fetch_assessments
+            to_row = api_note_to_row if entity_type == "note" else api_assessment_to_row
+            upsert_fn = upsert_notes if entity_type == "note" else upsert_assessments
 
-                try:
-                    if rows:
-                        if entity_type == "note":
-                            upserted = upsert_notes(conn, rows)
-                        else:
-                            upserted = upsert_assessments(conn, rows)
-                        conn.commit()
-                        entity_upserted += upserted
-                        for r in rows:
-                            parsed = _parse_date_field(r.get(date_field))
-                            if parsed:
-                                all_date_vals.append(parsed)
-                except Exception as exc:
-                    conn.rollback()
-                    logger.error("DB error upserting %ss patient_id=%s: %s", entity_type, patient_int_id, exc)
+            with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS) as pool:
+                futures = {
+                    pool.submit(fetch_fn, p["id"], since): p
+                    for p in eligible
+                }
+
+                for future in as_completed(futures):
+                    patient = futures[future]
+                    patient_int_id: int = patient["id"]
+
+                    try:
+                        records = future.result()
+                        rows = [to_row(r, source_id, fetched_at) for r in records]
+                    except RateLimitExhausted as exc:
+                        logger.error(
+                            "Rate limit exhausted %s patient_id=%s: %s",
+                            entity_type, patient_int_id, exc,
+                        )
+                        failed = True
+                        break
+                    except Exception as exc:
+                        logger.error(
+                            "Error fetching %ss patient_id=%s: %s",
+                            entity_type, patient_int_id, exc,
+                        )
+                        continue
+
+                    try:
+                        if rows:
+                            upserted = upsert_fn(conn, rows)
+                            conn.commit()
+                            entity_upserted += upserted
+                            for r in rows:
+                                parsed = _parse_date_field(r.get(date_field))
+                                if parsed:
+                                    all_date_vals.append(parsed)
+                    except Exception as exc:
+                        conn.rollback()
+                        logger.error(
+                            "DB error upserting %ss patient_id=%s: %s",
+                            entity_type, patient_int_id, exc,
+                        )
 
             if failed:
                 fail_watermark(conn, source_id, entity_type, facility_id)
